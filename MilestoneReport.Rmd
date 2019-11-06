@@ -1,0 +1,175 @@
+---
+title: "Milestone Report"
+author: "Christian Flessner"
+---
+
+```{r setup, include=FALSE}
+library(datasets)
+library(tm)
+library(openNLP)
+library(qdap)
+library(SnowballC)
+library(ggplot2)
+library(ngram)
+library(wordcloud)
+library(RWeka)
+library(dplyr)
+library(tidytext)
+library(textmineR)
+library(gridExtra)
+library(slam)
+```
+
+## Introduction
+
+This is the initial investigation into a shiny app that uses machine learning to predict the next word a user is going to write.  It contains the procedure used to load and clean the data, some basic summary statistics about the text files, and some exploratory analysis about word frequencies and how they relate together.
+
+##Load Data
+
+The first step is to load the text files into R.
+```{r Load Data}
+setwd("C:/Users/christian.flessner/Dropbox (ZirMed)/Christian Flessner/Coursera/Capstone")
+
+conB <- file("data/en_US/en_US.blogs.txt", "r")
+blogs<-readLines(conB)
+lengthB<-length(blogs)
+close(conB)
+
+conN <- file("data/en_US/en_US.news.txt", "r")
+news<-readLines(conN,encoding = 'UTF-8')
+lengthN<-length(news)
+close(conN)
+
+conT <- file("data/en_US/en_US.twitter.txt", "r")
+twitter<-readLines(conT)
+lengthT<-length(twitter)
+close(conT)
+```
+
+
+##Summary Stats
+Then we do some initial analysis on word and line count of the files.
+
+```{r Summary Stats, cache=TRUE,echo=FALSE}
+countStats<-data.frame(file=c("Blogs","News","Twitter"), 
+                       wordcount=c(wordcount(blogs),wordcount(news),
+                                   wordcount(twitter)), 
+                       linecount=c(length(blogs),length(news),
+                                   length(twitter)))
+wc<-ggplot(data=countStats, aes(x=factor(file), y=wordcount/100000))+
+        geom_bar(stat="identity")+labs(title="Word Counts Per File",
+                                  x="File", y="Number of Words (millions)")
+lc<-ggplot(data=countStats, aes(x=factor(file), y=linecount/100000))+
+        geom_bar(stat="identity")+labs(title="Line Counts Per File",
+                                  x="File", y="Number of Lines (millions)")
+grid.arrange(wc,lc,ncol=2)
+```
+
+
+## Creating Samples
+
+To do further exploratory analysis we scope down the files via the rbinom function in order to speed up our exploritory iterations.
+
+```{r Creating Samples}
+set.seed(111)
+sampleB<-blogs[rbinom(lengthB, 1,.01)==1]
+writeLines(sampleB, con="data/en_US/sample/blogSample.txt")
+
+set.seed(222)
+sampleN<-news[rbinom(lengthN, 1,.01)==1]
+writeLines(sampleN, con="data/en_US/sample/newsSample.txt")
+
+set.seed(333)
+sampleT<-twitter[rbinom(lengthT, 1,.01)==1]
+writeLines(sampleT, con="data/en_US/sample/twitterSample.txt")
+
+rm(blogs)
+rm(news)
+rm(twitter)
+```
+
+
+##Cleaning the Data
+Next we want to do some preprossesing to clean up the data.  This includes getting all of the files into one corpus (text database), removing punctuation, uppercase letters, whitespace, numbers and curse words to keep our predictions clean.  Then converting that corpus into a matrix to allow us to conduct some exploratory analysis on it.  We'll then take this matrix and convert it to 2 different dataframes one conataining the 20 most frequent words and one containing the 100 most frequent.
+
+```{r Cleaning Data}
+corp<-VCorpus(DirSource("data/en_US/sample"),
+              readerControl=list(language="en_US"))
+
+corp<-tm_map(corp, stripWhitespace)
+corp<-tm_map(corp, content_transformer(tolower))
+corp <- tm_map(corp, removePunctuation)
+corp <- tm_map(corp, removeNumbers)
+badwords<-c("ass","asshole","bastard","bitch","crap","cunt","damn","fuck"
+            ,"goddamn", "hell", "horseshit","motherfucker","nigga","nigger"
+            ,"prick","shit","slut", "son of a bitch", "tramp","twat", "whore")
+corp<-tm_map(corp, removeWords, badwords)
+corp<-tm_map(corp, stemDocument)
+
+tdm<-TermDocumentMatrix(corp)
+
+matrix<-as.matrix(tdm)
+term_count<-rowSums(matrix)
+term_count<-sort(term_count, decreasing = T)
+topTwenty<-as.data.frame(term_count[1:20])
+topTwenty<-cbind(word=rownames(topTwenty), topTwenty)
+names(topTwenty)[2]<-"cnt"
+
+topHundred<-as.data.frame(term_count[1:100])
+topHundred<-cbind(word=rownames(topHundred), topHundred)
+names(topHundred)[2]<-"cnt"
+```
+
+
+We can then graph the two data frames we created putting the top one hundred words into a word cloud and the top twenty into a bar graph.
+
+
+```{r Exploratory Graphs, echo=FALSE}
+bar<-ggplot(data=topTwenty,aes(x=reorder(word, cnt), y=cnt))+
+        geom_bar(stat="identity")+coord_flip()+
+        labs(title="Twenty Most Frequent Words", x="Word", y="Count")
+cloud<-wordcloud(words=topHundred$word, freq=topHundred$cnt,
+          colors=brewer.pal(8, "Dark2"))
+
+bar
+cloud
+```
+
+We can see that our most common words tend to be stopwords which usually get filtered out during text analysis, in this case we did not filter them out seeing as they are frequently going to be the next word a user types on their phone.
+
+The top 20 words make up a little over 16% of all the words in our text and the top 100 gets us to 29%
+```{r Most Frequent Word Percentage}
+totalWords<-wordcount(sampleN)+wordcount(sampleB)+wordcount(sampleT)
+sum(topTwenty$cnt)/totalWords
+sum(topHundred$cnt)/totalWords
+```
+
+##N-gram Analysis
+
+Given that our goal is to predict the next word a user types n-gram analysis seem particularly relevant.  A n-gram is a word combination i.e a bigram is a combination of two words that appear next to each other whereas a trigram is three words in sequence.  We can analyze these frequencies as well
+
+```{r N-gram analysis}
+ngram_plot<-function(n, data){
+tk<-function(x) NGramTokenizer(x, Weka_control(min = n, max = n))
+ngrams_matrix<-TermDocumentMatrix(data, control=list(tokenize=tk))
+ngrams_matrix <- as.matrix(rollup(ngrams_matrix, 2, na.rm=TRUE, FUN=sum))
+ngrams_matrix <- data.frame(word=rownames(ngrams_matrix), 
+                            freq=ngrams_matrix[,1])
+ngrams_matrix<-ngrams_matrix[order(-ngrams_matrix$freq),][1:20,]
+
+ggplot(ngrams_matrix, aes(x=reorder(word, -freq),y=freq))+
+        geom_bar(stat="identity")+
+        theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+        xlab("n-grams") + ylab("Frequency")
+}
+```
+
+###Bigram Plot
+```{r Bigram Plot}
+ngram_plot(2, corp)
+```
+
+###Trigram Plot
+```{r Trigram plot}
+ngram_plot(3, corp)
+```
